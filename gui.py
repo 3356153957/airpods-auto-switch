@@ -82,7 +82,7 @@ class SettingsGUI(ctk.CTk):
         self.after(150, self._refresh_status)
         self.after(80, self._process_tasks)
         if not background:
-            self.after(250, self._show_window)
+            self.after(250, lambda: self._show_window() if not self._hidden else None)
 
     @staticmethod
     def _delay_text(value):
