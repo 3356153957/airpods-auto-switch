@@ -1,267 +1,215 @@
-"""
-AirPods Auto-Switch — State Machine
-Core logic: monitors audio, manages Bluetooth connection lifecycle,
-handles cooldown timers, snooze state, and device handoff (yield).
-"""
-
+"""One-way, opt-in takeover. No media keys and no disconnect on silence."""
 import enum
-import time
-import threading
+import json
 import logging
-
-from audio_monitor import AudioMonitor
-from bluetooth_manager import BluetoothManager
-from media_control import send_media_pause
-from settings_manager import settings
-from config import AUDIO_POLL_INTERVAL
+import queue
+import threading
+import time
+from settings_manager import settings, COMMAND_DIR, STATUS_FILE, write_json
 
 log = logging.getLogger(__name__)
 
 
 class State(enum.Enum):
-    IDLE          = "Idle"
-    CONNECTING    = "Connecting…"
-    CONNECTED     = "Connected"
-    COOLDOWN      = "Cooldown"
-    DISCONNECTING = "Disconnecting…"
-    SNOOZED       = "Snoozed"
-    YIELDED       = "Yielded to Phone"
+    DISABLED = '自动接管已关闭'
+    IDLE = '等待电脑播放'
+    CONNECTING = '正在连接 AirPods'
+    CONNECTED = '已连接到电脑'
+    YIELDED = '已让出连接，等待下次播放'
+    FAILED = '连接未成功'
+
+
+class PlaybackTrigger:
+    """Debounce playback and require silence before reclaiming a lost connection."""
+    def __init__(self):
+        self.armed = True
+        self.started = None
+        self.silent_since = None
+
+    def reset(self, armed=True):
+        self.armed, self.started, self.silent_since = armed, None, None
+
+    def update(self, playing, now, delay):
+        if not playing:
+            self.started = None
+            if self.silent_since is None:
+                self.silent_since = now
+            if now - self.silent_since >= 1:
+                self.armed = True
+            return False
+        self.silent_since = None
+        if self.started is None:
+            self.started = now
+        if self.armed and now - self.started >= delay:
+            self.armed = False
+            return True
+        return False
 
 
 class AutoSwitchEngine:
-    """
-    Runs a background loop that:
-      1. Polls audio output levels every few seconds
-      2. Connects AirPods when audio is detected
-      3. Disconnects after a silence timeout
-      4. Supports snooze to pause auto-switching
-      5. Yields to phone on remote signal or robbery detection
-    """
-
-    def __init__(
-        self,
-        audio_monitor: AudioMonitor,
-        bt_manager: BluetoothManager,
-        on_state_change=None,
-    ):
+    def __init__(self, audio_monitor, bt_manager, on_state_change=None, on_notice=None, resume=None):
         self.audio = audio_monitor
         self.bt = bt_manager
         self.on_state_change = on_state_change
-
-        self._state = State.IDLE
-        self._snoozed = False
-        self._cooldown_start = None
-        self._last_connect_attempt: float = 0
-
-        self._running = False
+        self.on_notice = on_notice
+        self.on_ui_action = None
+        self.state = State.DISABLED
+        self._commands = queue.SimpleQueue()
+        self._stop = threading.Event()
         self._thread = None
-        self._lock = threading.Lock()
+        self._trigger = PlaybackTrigger()
+        self._last_enabled = None
+        self._device_name = None
+        self._lost_since = None
+        self._last_connected = False
+        if resume:
+            self.state = State[resume['state']]
+            self._last_enabled = resume['enabled']
+            self._device_name = resume['device_name']
+            self._last_connected = resume['last_connected']
+            self._lost_since = resume['lost_since']
+            self._trigger.armed = resume['armed']
+            self._trigger.started = resume['started']
+            self._trigger.silent_since = resume['silent_since']
 
-    # ── Properties ────────────────────────────────────────────────────
+    def export_runtime(self):
+        return {'state': self.state.name, 'enabled': self._last_enabled, 'device_name': self._device_name,
+                'last_connected': self._last_connected, 'lost_since': self._lost_since,
+                'armed': self._trigger.armed, 'started': self._trigger.started, 'silent_since': self._trigger.silent_since}
 
-    @property
-    def state(self) -> State:
-        with self._lock:
-            return self._state
+    def request_mode(self, background):
+        self._commands.put('background_mode' if background else 'window_mode')
 
-    @state.setter
-    def state(self, new: State):
-        with self._lock:
-            old = self._state
-            self._state = new
-        if old != new:
-            log.info(f"State: {old.value} → {new.value}")
+    def _set_state(self, value):
+        if self.state != value:
+            log.info('State: %s -> %s', self.state.value, value.value)
+            self.state = value
+            self._publish_status()
             if self.on_state_change:
-                try:
-                    self.on_state_change(new)
-                except Exception as exc:
-                    log.debug(f"State change callback error: {exc}")
+                self.on_state_change(value)
 
-    @property
-    def snoozed(self) -> bool:
-        with self._lock:
-            return self._snoozed
+    def _publish_status(self):
+        try:
+            write_json(STATUS_FILE, {'state': self.state.value, 'time': time.time(), 'source': self.audio.last_source})
+        except OSError:
+            log.warning('Status file is busy; next update will retry.')
 
-    # ── Public API ────────────────────────────────────────────────────
+    def notice(self, title, message, force=False):
+        log.info('Notice: %s | %s', title, message)
+        if self.on_notice and (force or settings.get('NOTIFICATIONS_ENABLED', True)):
+            self.on_notice(title, message)
 
     def start(self):
-        if self._running:
+        if self._thread and self._thread.is_alive():
             return
-        self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="AutoSwitchEngine")
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name='AirPodsEngine', daemon=True)
         self._thread.start()
-        log.info("Engine started.")
 
     def stop(self):
-        self._running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=10)
-        log.info("Engine stopped.")
-
-    def snooze(self):
-        with self._lock:
-            self._snoozed = True
-        log.info("Snoozed — auto-switching paused.")
-        if self.state in (State.CONNECTED, State.COOLDOWN, State.CONNECTING):
-            self._do_disconnect()
-        self.state = State.SNOOZED
-
-    def unsnooze(self):
-        with self._lock:
-            self._snoozed = False
-        log.info("Unsnooze — auto-switching resumed.")
-        self.state = State.IDLE
-
-    def toggle_snooze(self):
-        if self.snoozed:
-            self.unsnooze()
-        else:
-            self.snooze()
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=18)
 
     def manual_connect(self):
-        if self.snoozed:
-            return
-        self._do_connect()
+        self._commands.put('connect')
 
     def manual_disconnect(self):
-        self._do_disconnect()
-        self.state = State.IDLE
+        self._commands.put('disconnect')
 
-    def yield_to_phone(self):
-        """
-        Hand off AirPods to phone. Called by:
-        - HandoffListener (ntfy.sh remote signal from iPhone Shortcuts)
-        - Robbery Detector (BT connection lost while audio was playing)
-        
-        Pauses Windows media, drops BT, enters YIELDED state.
-        Auto-recovers when Windows audio starts playing again.
-        """
-        log.info("⚡ YIELD: Handing off AirPods to phone.")
-        
-        # Only pause Windows media if audio is actually playing
-        if self.audio.is_audio_playing():
-            log.info("Audio was playing — pausing Windows media so speakers don't blast.")
-            send_media_pause()
+    def _connect(self, automatic=False):
+        self._set_state(State.CONNECTING)
+        if automatic:
+            self.notice('正在切换到电脑', f'检测到 {self.audio.last_source or "电脑"} 播放音频，正在连接耳机。')
+        if self.bt.connect(cancel=self._stop, automatic=automatic):
+            self._last_connected = True
+            self._lost_since = None
+            self._set_state(State.CONNECTED)
+            self.notice('AirPods 已切换到电脑', '电脑音频现已输出到耳机。')
         else:
-            log.info("Audio already paused — skipping media pause.")
-        
-        # Drop BT connection if still connected
-        if self.bt.is_connected():
-            self._do_disconnect()
-        
-        self.state = State.YIELDED
-        log.info("Yielded — waiting for Windows audio to auto-recover.")
+            self._set_state(State.FAILED)
+            if not self._stop.is_set() and (not automatic or settings.get('AUTO_CONNECT_ENABLED')):
+                self.notice('AirPods 连接未成功', '请确认耳机已取出且在附近。可在托盘菜单中选择“立即连接”。')
 
-    # ── Main Loop ─────────────────────────────────────────────────────
+    def _read_commands(self):
+        COMMAND_DIR.mkdir(parents=True, exist_ok=True)
+        for path in sorted(COMMAND_DIR.glob('*.json')):
+            try:
+                self._commands.put(json.loads(path.read_text(encoding='utf-8'))['action'])
+            except (ValueError, KeyError, OSError):
+                log.warning('Invalid local command %s', path.name)
+            finally:
+                path.unlink(missing_ok=True)
+        while not self._commands.empty() and not self._stop.is_set():
+            action = self._commands.get()
+            if action == 'connect':
+                self._connect()
+            elif action == 'disconnect':
+                settings.set('AUTO_CONNECT_ENABLED', False)
+                if self.bt.disconnect(cancel=self._stop):
+                    self.notice('已断开电脑连接', '自动接管已关闭，可在手机上连接耳机。')
+                else:
+                    self.notice('自动接管已关闭', '未能确认耳机已断开，请检查 Windows 蓝牙连接。')
+                self._set_state(State.DISABLED)
+            elif action == 'test_notification':
+                self.notice('AirPods 提示测试', '连接结果会在右下角显示；Windows 勿扰模式可能会隐藏提示。', force=True)
+            elif action in ('show_settings', 'hide_settings', 'quit') and self.on_ui_action:
+                self.on_ui_action(action)
+            elif action in ('background_mode', 'window_mode') and self.on_ui_action:
+                from app_lifecycle import save_runtime
+                save_runtime(self.export_runtime())
+                self._stop.set()
+                self.on_ui_action('relaunch', action == 'background_mode')
+
+    def _tick(self):
+        cfg = settings.snapshot()
+        enabled = bool(cfg['AUTO_CONNECT_ENABLED'])
+        name = cfg['DEVICE_NAME']
+        if enabled != self._last_enabled or name != self._device_name:
+            self._trigger.reset()
+            self._last_enabled, self._device_name = enabled, name
+            self._lost_since = None
+            self._last_connected = False
+            self._set_state(State.IDLE if enabled else State.DISABLED)
+        if not enabled:
+            return
+        now = time.monotonic()
+        playing = self.audio.is_audio_playing()
+        connected = self.bt.is_connected()
+        is_default = connected and self.bt.is_default_output()
+        if is_default:
+            self._last_connected = True
+            self._lost_since = None
+            self._set_state(State.CONNECTED)
+            self._trigger.reset(armed=False)
+            return
+        if self._last_connected:
+            if self._lost_since is None:
+                self._lost_since = now
+            if now - self._lost_since < 3:
+                return
+            self._last_connected = False
+            self._trigger.reset(armed=False)
+            self._set_state(State.YIELDED)
+            self.notice('AirPods 已离开电脑', '当前播放期间暂停接管；电脑静音后，下次播放会再次尝试连接。')
+        if self._trigger.update(playing, now, float(cfg['AUDIO_START_DELAY'])):
+            self._connect(automatic=True)
 
     def _loop(self):
-        """Background thread: poll audio, manage state transitions."""
-        _last_state_log = 0
-        
-        # Initialize state based on actual bluetooth connection
-        if self.bt.is_connected():
-            log.info("AirPods are already connected at startup. Initialising as CONNECTED.")
-            self.state = State.CONNECTED
-
-        while self._running:
-            try:
-                if self.snoozed:
-                    time.sleep(AUDIO_POLL_INTERVAL)
-                    continue
-
-                current = self.state
-                audio_playing = self.audio.is_audio_playing()
-
-                # Log current state every ~30 seconds for debugging
-                now = time.monotonic()
-                if now - _last_state_log > 30:
-                    remaining = ""
-                    if current == State.COOLDOWN and self._cooldown_start:
-                        elapsed = now - self._cooldown_start
-                        remaining = f" ({settings.get('DISCONNECT_TIMEOUT', 2) - elapsed:.0f}s remaining)"
-                    log.info(f"[tick] state={current.value}, audio={audio_playing}{remaining}")
-                    _last_state_log = now
-
-                # ── IDLE ──────────────────────────────────────────
-                if current == State.IDLE:
-                    if audio_playing:
-                        self._do_connect()
-                    elif self.bt.is_connected():
-                        log.info("AirPods detected as connected while IDLE. Updating state to CONNECTED.")
-                        self.state = State.CONNECTED
-
-                # ── CONNECTED ─────────────────────────────────────
-                elif current == State.CONNECTED:
-                    # Robbery Detector: check if another device stole the AirPods
-                    if not self.bt.is_connected():
-                        log.info("🚨 ROBBERY DETECTED: AirPods disconnected unexpectedly!")
-                        if audio_playing:
-                            log.info("Audio was playing — pausing media and yielding to phone.")
-                            send_media_pause()
-                        self.state = State.YIELDED
-                    elif not audio_playing and settings.get('DISCONNECT_ON_SILENCE', False):
-                        self._start_cooldown()
-
-                # ── COOLDOWN ──────────────────────────────────────
-                elif current == State.COOLDOWN:
-                    # Robbery during cooldown
-                    if not self.bt.is_connected():
-                        log.info("🚨 ROBBERY DETECTED during cooldown!")
-                        self.state = State.YIELDED
-                    elif audio_playing:
-                        log.info("Audio resumed during cooldown — staying connected.")
-                        self._cooldown_start = None
-                        self.state = State.CONNECTED
-                    elif self._cooldown_expired():
-                        self._do_disconnect()
-                        self.state = State.IDLE
-
-                # ── YIELDED ───────────────────────────────────────
-                elif current == State.YIELDED:
-                    # Auto-recover: when Windows audio starts, reclaim AirPods
-                    if audio_playing:
-                        log.info("🔄 Audio detected while YIELDED — reclaiming AirPods!")
-                        self._do_connect()
-
-            except Exception as exc:
-                log.error(f"Loop error: {exc}", exc_info=True)
-
-            time.sleep(AUDIO_POLL_INTERVAL)
-
-    # ── State Transitions ─────────────────────────────────────────────
-
-    def _do_connect(self):
-        """Attempt to connect AirPods."""
-        if self.bt.is_connected():
-            log.info("Already connected via Bluetooth. Updating state.")
-            self.state = State.CONNECTED
-            return
-
-        now = time.monotonic()
-        if now - self._last_connect_attempt < settings.get('CONNECTION_RETRY_DELAY', 5):
-            return
-
-        self._last_connect_attempt = now
-        self.state = State.CONNECTING
-
-        if self.bt.connect():
-            self.state = State.CONNECTED
-        else:
-            log.info("Connection failed — will retry on next audio cycle.")
-            self.state = State.IDLE
-
-    def _do_disconnect(self):
-        """Disconnect AirPods."""
-        self.state = State.DISCONNECTING
-        self.bt.disconnect()
-        self._cooldown_start = None
-
-    def _start_cooldown(self):
-        self._cooldown_start = time.monotonic()
-        self.state = State.COOLDOWN
-        log.info(f"Audio stopped — cooldown started ({settings.get('DISCONNECT_TIMEOUT', 2)}s).")
-
-    def _cooldown_expired(self) -> bool:
-        if self._cooldown_start is None:
-            return False
-        return (time.monotonic() - self._cooldown_start) >= settings.get('DISCONNECT_TIMEOUT', 2)
+        import comtypes
+        comtypes.CoInitialize()
+        try:
+            while not self._stop.is_set():
+                try:
+                    self._read_commands()
+                    if self._stop.is_set():
+                        break
+                    self._tick()
+                    self._publish_status()
+                except Exception:
+                    log.exception('Engine cycle failed')
+                self._stop.wait(0.35)
+        finally:
+            self.audio.cleanup()
+            comtypes.CoUninitialize()
+            write_json(STATUS_FILE, {'state': '程序已退出', 'time': 0, 'source': ''})

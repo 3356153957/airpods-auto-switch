@@ -1,109 +1,67 @@
-"""
-AirPods Auto-Switch
-───────────────────
-Automatically connects your AirPods to Windows when audio plays,
-and releases them back to iPhone/iPad after silence.
-
-Usage:  python main.py
-"""
-
-import sys
-import os
+"""Single-instance app: Tk owns the UI thread; audio and the tray run separately."""
 import ctypes
 import logging
+import sys
+from logging.handlers import RotatingFileHandler
+from settings_manager import SETTINGS_DIR, send_command
 
-from config import LOG_LEVEL
 
-
-def setup_logging():
-    log_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "AirPodsAutoSwitch")
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, "airpods.log")
-    
-    logging.basicConfig(
-        level=getattr(logging, LOG_LEVEL, logging.INFO),
-        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-        datefmt="%H:%M:%S",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(sys.stderr)
-        ]
-    )
-
-    def handle_exception(exc_type, exc_value, exc_traceback):
-        if issubclass(exc_type, KeyboardInterrupt):
-            sys.__excepthook__(exc_type, exc_value, exc_traceback)
-            return
-        logging.getLogger("main").critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
-
-    sys.excepthook = handle_exception
+def instance_lock(settings_window=False):
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel.CreateMutexW.restype = ctypes.c_void_p
+    handle = kernel.CreateMutexW(None, False, 'Local\\AirPodsSwitchLocal' + ('QuickMenu' if settings_window == 'quick-menu' else 'Tray'))
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return handle, ctypes.get_last_error() != 183
 
 
 def main():
-    if "--settings" in sys.argv:
-        import gui
-        gui.open_settings_window()
-        sys.exit(0)
-
-    setup_logging()
-    log = logging.getLogger("main")
-
-    log.info("=" * 50)
-    log.info("  AirPods Auto-Switch starting")
-    log.info("=" * 50)
-
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('AirPodsSwitch.Local')
+    if '--ui-preview' in sys.argv:
+        from gui import SettingsGUI
+        SettingsGUI(preview=True).mainloop()
+        return
+    if '--quick-menu' in sys.argv:
+        mutex, first = instance_lock('quick-menu')
+        if first:
+            from gui import SettingsGUI
+            from ui_popups import TrayMenu
+            position = sys.argv.index('--quick-menu')
+            panel = SettingsGUI(background=True)
+            panel.quick_menu = True
+            menu = TrayMenu(panel, int(sys.argv[position+1]), int(sys.argv[position+2]))
+            def check_closed():
+                if menu.winfo_exists():
+                    panel.after(100, check_closed)
+                else:
+                    panel.destroy()
+            panel.after(500, check_closed)
+            panel.mainloop()
+        return
+    from app_lifecycle import wait_for_parent, load_runtime
+    wait_for_parent()
+    mutex, first = instance_lock()
+    if not first:
+        send_command('show_settings')
+        return
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    handlers = [RotatingFileHandler(SETTINGS_DIR / 'airpods.log', maxBytes=2_000_000, backupCount=2, encoding='utf-8')]
+    if sys.stderr:
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s', handlers=handlers)
     from audio_monitor import AudioMonitor
     from bluetooth_manager import BluetoothManager
     from state_machine import AutoSwitchEngine
-    from tray_app import TrayApp
-    from handoff_listener import HandoffListener
-    from settings_manager import settings
-
-    # ── Initialise components ─────────────────────────────────────────
-    bt = BluetoothManager()
-
-    if not bt.is_available():
-        log.error("Bluetooth is not available. Exiting.")
-        sys.exit(1)
-
-    device = bt.find_device()
-    if device:
-        log.info(f"Found target device: {device.szName}")
+    from tray_app import TrayApp, HeadlessPanel
+    if '--background' in sys.argv:
+        panel = HeadlessPanel()
     else:
-        log.warning(
-            f"Target device not found in paired list. "
-            f"Will keep looking during runtime."
-        )
-
-    audio = AudioMonitor()
-    engine = AutoSwitchEngine(audio_monitor=audio, bt_manager=bt)
-    tray = TrayApp(engine)
-
-    # ── Handoff Listener (ntfy.sh cloud relay) ────────────────────────
-    handoff = None
-    if settings.get("HANDOFF_ENABLED", True):
-        topic = settings.get("HANDOFF_TOPIC", "")
-        if topic:
-            handoff = HandoffListener(engine=engine, topic=topic)
-            handoff.start()
-            log.info(f"📱 iPhone Handoff URL: https://ntfy.sh/{topic}")
-        else:
-            log.warning("Handoff enabled but no topic configured.")
-
-    # ── Start ─────────────────────────────────────────────────────────
-    engine.start()
-
-    try:
-        tray.run()  # Blocking — runs the Windows message loop
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if handoff:
-            handoff.stop()
-        engine.stop()
-        audio.cleanup()
-        log.info("Goodbye.")
+        from gui import SettingsGUI
+        panel = SettingsGUI()
+    engine = AutoSwitchEngine(AudioMonitor(), BluetoothManager(), resume=load_runtime())
+    TrayApp(engine, panel).run()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

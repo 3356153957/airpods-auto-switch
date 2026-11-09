@@ -3,3 +3,4 @@ pillow
 pycaw
 comtypes
 customtkinter
+psutil

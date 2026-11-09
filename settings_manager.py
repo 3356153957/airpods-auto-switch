@@ -1,73 +1,88 @@
-import os
+"""Local settings shared by the tray process and settings window."""
+import copy
 import json
-import random
-import string
+import logging
+import os
+import threading
+import time
+import uuid
+from pathlib import Path
 
-
-def _generate_topic():
-    """Generate a random topic name for ntfy.sh handoff."""
-    suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
-    return f"airpods-switch-{suffix}"
-
-
+log = logging.getLogger(__name__)
 DEFAULT_SETTINGS = {
-    "DEVICE_NAME": "rei\u2019s AirPods Pro",
-    "AUDIO_THRESHOLD": 0.001,
-    "DISCONNECT_ON_SILENCE": False,
-    "DISCONNECT_TIMEOUT": 2,
-    "CONNECTION_RETRY_DELAY": 5,
-    "BLACKLIST_ENABLED": True,
-    "APP_BLACKLIST": ["explorer.exe", "ms-teams.exe"],
-    "HANDOFF_ENABLED": True,
-    "HANDOFF_TOPIC": "",  # Generated once on first run, then persisted
+    'DEVICE_NAME': '',
+    'AUTO_CONNECT_ENABLED': False,
+    'NOTIFICATIONS_ENABLED': True,
+    'TRAY_HINT_ENABLED': True,
+    'AUDIO_THRESHOLD': 0.001,
+    'AUDIO_START_DELAY': 1.0,
+    'APP_BLACKLIST': ['explorer.exe', 'wallpaper32.exe', 'wallpaper64.exe'],
 }
+SETTINGS_DIR = Path(os.environ.get('AIRPODS_SWITCH_DATA_DIR', Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'AirPodsSwitchLocal'))
+SETTINGS_FILE = SETTINGS_DIR / 'settings.json'
+STATUS_FILE = SETTINGS_DIR / 'status.json'
+COMMAND_DIR = SETTINGS_DIR / 'commands'
 
-SETTINGS_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "AirPodsAutoSwitch")
-SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
+
+def write_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    try:
+        temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
+        for attempt in range(6):
+            try:
+                os.replace(temp, path)
+                break
+            except PermissionError:
+                # A reader or antivirus may briefly hold a handle without delete sharing.
+                if attempt == 5:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+    finally:
+        temp.unlink(missing_ok=True)
+
 
 class SettingsManager:
-    def __init__(self):
-        self.settings = DEFAULT_SETTINGS.copy()
-        self.load()
-        self._ensure_handoff_topic()
+    def __init__(self, path=SETTINGS_FILE):
+        self.path = Path(path)
+        self._lock = threading.RLock()
+        self._values = copy.deepcopy(DEFAULT_SETTINGS)
+        self._mtime = None
+        if not self.path.exists():
+            write_json(self.path, self._values)
+        self.snapshot()
 
-    def _ensure_handoff_topic(self):
-        """Generate a stable handoff topic on first run and persist it."""
-        if not self.settings.get("HANDOFF_TOPIC"):
-            self.settings["HANDOFF_TOPIC"] = _generate_topic()
-            self.save()
-
-    def load(self):
-        if not os.path.exists(SETTINGS_DIR):
-            os.makedirs(SETTINGS_DIR, exist_ok=True)
-        
-        if os.path.exists(SETTINGS_FILE):
+    def snapshot(self):
+        with self._lock:
             try:
-                with open(SETTINGS_FILE, "r") as f:
-                    loaded = json.load(f)
-                    self.settings.update(loaded)
-            except Exception as e:
-                print(f"Failed to load settings: {e}")
-        else:
-            self.save()
-
-    def save(self):
-        if not os.path.exists(SETTINGS_DIR):
-            os.makedirs(SETTINGS_DIR, exist_ok=True)
-        try:
-            with open(SETTINGS_FILE, "w") as f:
-                json.dump(self.settings, f, indent=4)
-        except Exception as e:
-            print(f"Failed to save settings: {e}")
+                stamp = self.path.stat().st_mtime_ns
+                if stamp != self._mtime:
+                    values = json.loads(self.path.read_text(encoding='utf-8'))
+                    if not isinstance(values, dict):
+                        raise ValueError('Settings must be an object')
+                    self._values = copy.deepcopy(DEFAULT_SETTINGS) | values
+                    self._mtime = stamp
+            except (OSError, ValueError):
+                log.warning('Could not reload settings; retaining last valid values.', exc_info=True)
+            return copy.deepcopy(self._values)
 
     def get(self, key, default=None):
-        # Always reload on get to ensure we have the latest settings from GUI
-        self.load()
-        return self.settings.get(key, default)
+        return self.snapshot().get(key, default)
+
+    def update(self, values):
+        with self._lock:
+            merged = self.snapshot() | values
+            write_json(self.path, merged)
+            self._mtime = None
+            self.snapshot()
 
     def set(self, key, value):
-        self.settings[key] = value
-        self.save()
+        self.update({key: value})
 
-# Global instance
+
+def send_command(action):
+    write_json(COMMAND_DIR / (uuid.uuid4().hex + '.json'), {'action': action})
+
+
 settings = SettingsManager()

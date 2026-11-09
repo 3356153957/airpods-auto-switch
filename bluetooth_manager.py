@@ -1,10 +1,4 @@
-"""
-AirPods Auto-Switch — Bluetooth Manager
-Connects / disconnects a paired Bluetooth audio device by toggling
-its PnP (Plug and Play) device entry via PowerShell.
-
-Requires admin privileges (the app auto-elevates via main.py).
-"""
+"""Connect a paired headset, then verify its actual Windows playback endpoint."""
 
 import ctypes
 from ctypes import wintypes
@@ -12,6 +6,8 @@ import logging
 import os
 import subprocess
 import time
+import sys
+from pathlib import Path
 
 from settings_manager import settings
 
@@ -173,7 +169,7 @@ class BluetoothManager:
                 ctypes.byref(search_params), ctypes.byref(device_info)
             )
 
-            if search_handle == INVALID_HANDLE_VALUE:
+            if not search_handle or search_handle == INVALID_HANDLE_VALUE:
                 log.debug("No Bluetooth devices found.")
                 return None
 
@@ -181,7 +177,7 @@ class BluetoothManager:
                 while True:
                     name = device_info.szName
                     if self._normalize(name) == self._normalize(self.device_name):
-                        log.info(f"Target device found: {name} (connected={bool(device_info.fConnected)})")
+                        log.debug(f"Target device found: {name} (connected={bool(device_info.fConnected)})")
                         return device_info
 
                     device_info = BLUETOOTH_DEVICE_INFO()
@@ -197,53 +193,101 @@ class BluetoothManager:
         return None
 
     def is_connected(self) -> bool:
-        device = self.find_device()
-        if device is None:
+        return self.active_endpoint() is not None
+
+    def active_endpoint(self):
+        from audio_endpoints import find_active_endpoint
+        return find_active_endpoint(self._normalize(self.device_name), self._normalize)
+
+    def is_default_output(self):
+        from audio_endpoints import default_output_name
+        try:
+            return self._normalize(self.device_name) in self._normalize(default_output_name())
+        except Exception:
             return False
-        return bool(device.fConnected)
+
+    @staticmethod
+    def paired_devices():
+        params = BLUETOOTH_DEVICE_SEARCH_PARAMS()
+        params.fReturnAuthenticated = True
+        params.fReturnRemembered = True
+        info = BLUETOOTH_DEVICE_INFO()
+        if not _bth:
+            return []
+        handle = _bth.BluetoothFindFirstDevice(ctypes.byref(params), ctypes.byref(info))
+        if not handle or handle == INVALID_HANDLE_VALUE:
+            return []
+        names = []
+        try:
+            while True:
+                if 'airpods' in info.szName.casefold():
+                    names.append(info.szName)
+                info = BLUETOOTH_DEVICE_INFO()
+                if not _bth.BluetoothFindNextDevice(handle, ctypes.byref(info)):
+                    break
+        finally:
+            _bth.BluetoothFindDeviceClose(handle)
+        return sorted(set(names))
 
     def _get_bttools_exe(self) -> str:
-        """Get the persistent path to the BluetoothDevicePairing CLI tool."""
-        local_app_data = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
-        app_dir = os.path.join(local_app_data, "AirPodsAutoSwitch")
-        return os.path.join(app_dir, "bttools", "BluetoothDevicePairing.exe")
+        base = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
+        return str(base / 'vendor' / 'BluetoothDevicePairing.exe')
 
-    def connect(self) -> bool:
+    def connect(self, cancel=None, automatic=False) -> bool:
         """Connect AirPods using BluetoothDevicePairing CLI tool."""
         mac = self._get_mac_address()
         if not mac:
             log.warning("Cannot connect: Device MAC not found.")
             return False
 
-        self._ensure_bttools()
         exe = self._get_bttools_exe()
+        if not Path(exe).is_file():
+            log.error('Bluetooth tool missing: %s', exe)
+            return False
         
         log.info(f"Connecting {self.device_name} (MAC: {mac})...")
         try:
-            result = subprocess.run(
-                [exe, "pair-by-mac", "--mac", mac, "--type", "Bluetooth"],
-                capture_output=True, text=True, timeout=15,
-                creationflags=0x08000000
-            )
-            log.debug(f"Connect stdout: {result.stdout.strip()}")
-            if result.returncode == 0:
-                log.info(f"{self.device_name} connected.")
-                return True
-            else:
-                log.error(f"Connect failed: {result.stderr.strip()}")
-                return False
+            if not self.is_connected():
+                result = subprocess.run(
+                    [exe, 'pair-by-mac', '--mac', mac, '--type', 'Bluetooth'],
+                    capture_output=True, text=True, timeout=12,
+                    creationflags=0x08000000,
+                )
+                log.info('Connection tool exit=%s: %s %s', result.returncode, result.stdout.strip(), result.stderr.strip())
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if cancel and cancel.is_set():
+                    return False
+                if automatic and not settings.get('AUTO_CONNECT_ENABLED', False):
+                    return False
+                endpoint = self.active_endpoint()
+                if endpoint:
+                    from pycaw.pycaw import AudioUtilities
+                    from pycaw.constants import ERole
+                    # Only playback defaults; leave the user's microphone selection alone.
+                    AudioUtilities.SetDefaultDevice(endpoint.id, [ERole.eConsole, ERole.eMultimedia])
+                    if self.is_default_output():
+                        log.info('Verified active AirPods playback endpoint and default output.')
+                        return True
+                if cancel:
+                    cancel.wait(0.35)
+                else:
+                    time.sleep(0.35)
+            log.warning('No usable AirPods playback endpoint after connection attempt.')
+            return False
         except Exception as e:
             log.error(f"Connect exception: {e}")
             return False
 
-    def disconnect(self) -> bool:
+    def disconnect(self, cancel=None) -> bool:
         """Disconnect AirPods using BluetoothDevicePairing CLI tool."""
+        if not self.is_connected():
+            return True
         mac = self._get_mac_address()
         if not mac:
             log.warning("Cannot disconnect: Device MAC not found.")
             return False
 
-        self._ensure_bttools()
         exe = self._get_bttools_exe()
         
         log.info(f"Disconnecting {self.device_name} (MAC: {mac})...")
@@ -253,13 +297,16 @@ class BluetoothManager:
                 capture_output=True, text=True, timeout=15,
                 creationflags=0x08000000
             )
-            log.debug(f"Disconnect stdout: {result.stdout.strip()}")
-            if result.returncode == 0:
-                log.info(f"{self.device_name} disconnected.")
-                return True
-            else:
-                log.error(f"Disconnect failed: {result.stderr.strip()}")
-                return False
+            log.info('Disconnect tool exit=%s: %s %s', result.returncode, result.stdout.strip(), result.stderr.strip())
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if not self.is_connected():
+                    return True
+                if cancel and cancel.wait(0.35):
+                    return False
+                if cancel is None:
+                    time.sleep(0.35)
+            return False
         except Exception as e:
             log.error(f"Disconnect exception: {e}")
             return False
@@ -274,33 +321,6 @@ class BluetoothManager:
         hex_mac = ":".join(f"{b:02X}" for b in reversed(bytes_array))
         return hex_mac
         
-    def _ensure_bttools(self):
-        """Download the BluetoothDevicePairing CLI tool if it doesn't exist."""
-        import urllib.request, zipfile
-        exe_path = self._get_bttools_exe()
-        bttools_dir = os.path.dirname(exe_path)
-        
-        if os.path.exists(exe_path):
-            return
-            
-        log.info("Downloading BluetoothDevicePairing CLI tool...")
-        os.makedirs(bttools_dir, exist_ok=True)
-        zip_path = os.path.join(bttools_dir, "bt.zip")
-        
-        try:
-            url = "https://github.com/PolarGoose/BluetoothDevicePairing/releases/download/v12.0/BluetoothDevicePairing.zip"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as response, open(zip_path, 'wb') as out_file:
-                out_file.write(response.read())
-            
-            with zipfile.ZipFile(zip_path, 'r') as z:
-                z.extractall(bttools_dir)
-                
-            os.remove(zip_path)
-            log.info("BluetoothDevicePairing tool setup complete.")
-        except Exception as e:
-            log.error(f"Failed to setup bttools: {e}")
-
     def _get_radio(self) -> "wintypes.HANDLE | None":
         """Get a handle to the first Bluetooth radio."""
         params = BLUETOOTH_FIND_RADIO_PARAMS()
@@ -308,7 +328,7 @@ class BluetoothManager:
         find_handle = _bth.BluetoothFindFirstRadio(
             ctypes.byref(params), ctypes.byref(radio_handle)
         )
-        if find_handle == INVALID_HANDLE_VALUE:
+        if not find_handle or find_handle == INVALID_HANDLE_VALUE:
             log.warning("No Bluetooth radio found.")
             return None
         _bth.BluetoothFindRadioClose(find_handle)

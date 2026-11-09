@@ -13,3 +13,10 @@ bttools/
 *.log
 .vscode/
 .idea/
+.venv/
+release/
+*.zip
+settings.json
+status.json
+panel-state.json
+runtime-resume.json

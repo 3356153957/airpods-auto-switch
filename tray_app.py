@@ -1,150 +1,105 @@
-"""
-AirPods Auto-Switch — System Tray App
-Provides a tray icon with colour-coded status and a context menu
-for snooze, manual connect/disconnect, and quit.
-"""
-
+"""Native tray icon, custom light menu, and Windows connection notifications."""
+import ctypes
+from ctypes import wintypes
 import logging
 import threading
-
 import pystray
-from PIL import Image, ImageDraw, ImageFont
-
+from pystray._util import win32
+from PIL import ImageDraw
+from settings_manager import settings, send_command
 from state_machine import State
+from ui_styles import app_icon
 
 log = logging.getLogger(__name__)
-
-# ── Icon Colours ──────────────────────────────────────────────────────
-STATE_COLORS = {
-    State.IDLE:          ("#9CA3AF", "#6B7280"),  # Gray
-    State.CONNECTING:    ("#60A5FA", "#3B82F6"),  # Blue
-    State.CONNECTED:     ("#34D399", "#10B981"),  # Green
-    State.COOLDOWN:      ("#FBBF24", "#F59E0B"),  # Amber
-    State.DISCONNECTING: ("#F87171", "#EF4444"),  # Red
-    State.SNOOZED:       ("#F87171", "#EF4444"),  # Red
-    State.YIELDED:       ("#C084FC", "#A855F7"),  # Purple — handed to phone
-}
+COLORS = {State.DISABLED: '#8A99A8', State.IDLE: '#3479CE', State.CONNECTING: '#D49A36', State.CONNECTED: '#14946F', State.YIELDED: '#8A99A8', State.FAILED: '#D16068'}
 
 
-def _make_icon(state: State, size: int = 64) -> Image.Image:
-    """Generate a clean headphone icon with state-coloured accents."""
-    fg, accent = STATE_COLORS.get(state, ("#9CA3AF", "#6B7280"))
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
+def make_icon(state=State.IDLE):
+    image = app_icon(128)
+    d = ImageDraw.Draw(image)
+    d.ellipse((85, 85, 126, 126), fill='white')
+    d.ellipse((91, 91, 120, 120), fill=COLORS[state])
+    return image
 
-    cx, cy = size // 2, size // 2
-    r = size // 2 - 4
 
-    # Headband arc (top half of a circle)
-    draw.arc(
-        [cx - r, cy - r, cx + r, cy + r],
-        start=200, end=340,
-        fill=fg, width=max(3, size // 16),
-    )
+def open_settings():
+    send_command('show_settings')
 
-    # Left ear cup
-    cup_w, cup_h = size // 5, size // 3
-    lx = cx - r + 2
-    ly = cy
-    draw.rounded_rectangle(
-        [lx - cup_w // 2, ly - 2, lx + cup_w // 2, ly + cup_h],
-        radius=cup_w // 3, fill=accent,
-    )
 
-    # Right ear cup
-    rx = cx + r - 2
-    ry = cy
-    draw.rounded_rectangle(
-        [rx - cup_w // 2, ry - 2, rx + cup_w // 2, ry + cup_h],
-        radius=cup_w // 3, fill=accent,
-    )
+class PanelIcon(pystray.Icon):
+    def __init__(self, *args, panel=None, **kwargs):
+        self.panel = panel
+        super().__init__(*args, **kwargs)
 
-    # State dot (bottom-right corner)
-    dot_r = size // 8
-    draw.ellipse(
-        [size - dot_r * 2 - 2, size - dot_r * 2 - 2, size - 2, size - 2],
-        fill=accent,
-    )
-
-    return img
+    def _on_notify(self, wparam, lparam):
+        if lparam == win32.WM_RBUTTONUP:
+            point = wintypes.POINT()
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+            self.panel.dispatch('tray_menu', point.x, point.y)
+        elif lparam == win32.WM_LBUTTONUP:
+            self.panel.dispatch('show_settings')
+        else:
+            super()._on_notify(wparam, lparam)
 
 
 class TrayApp:
-    """System tray interface for AirPods Auto-Switch."""
-
-    def __init__(self, engine):
-        """
-        Args:
-            engine: AutoSwitchEngine instance
-        """
+    def __init__(self, engine, panel):
         self.engine = engine
-        self.engine.on_state_change = self._on_state_change
+        self.panel = panel
+        engine.on_state_change = self._on_state_change
+        engine.on_notice = self.notify
+        engine.on_ui_action = panel.dispatch
+        panel.engine = engine
+        panel.on_background_request = lambda: engine.request_mode(True)
+        self._icon = PanelIcon('AirPodsSwitchLocal', make_icon(engine.state), 'AirPods · '+engine.state.value, panel=panel)
+        panel.tray = self
+        self.ready = threading.Event()
 
-        self._icon = pystray.Icon(
-            name="AirPods Auto-Switch",
-            icon=_make_icon(State.IDLE),
-            title="AirPods Auto-Switch — Idle",
-            menu=self._build_menu(),
-        )
+    def notify(self, title, message):
+        if self.ready.is_set():
+            try:
+                self._icon.notify(message, title)
+            except Exception:
+                log.exception('Windows notification could not be sent')
 
-    # ── Public API ────────────────────────────────────────────────────
+    def _on_state_change(self, state):
+        self._icon.icon = make_icon(state)
+        self._icon.title = 'AirPods · ' + state.value
+
+    def _setup(self, icon):
+        icon.visible = True
+        self.ready.set()
+        self.engine.start()
 
     def run(self):
-        """Run the tray app (blocking). Call from main thread."""
-        log.info("Tray app starting.")
-        self._icon.run()
-
-    def stop(self):
-        """Stop the tray app."""
-        self._icon.stop()
-
-    # ── Menu ──────────────────────────────────────────────────────────
-
-    def _build_menu(self) -> pystray.Menu:
-        return pystray.Menu(
-            pystray.MenuItem(
-                lambda _: f"Status: {self.engine.state.value}",
-                action=None,
-                enabled=False,
-            ),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem(
-                lambda _: "Resume" if self.engine.snoozed else "Snooze",
-                self._on_snooze_toggle,
-            ),
-            pystray.MenuItem("Connect Now", self._on_connect),
-            pystray.MenuItem("Disconnect Now", self._on_disconnect),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Settings", self._on_settings),
-            pystray.MenuItem("Quit", self._on_quit),
-        )
-
-    # ── Callbacks ─────────────────────────────────────────────────────
-
-    def _on_state_change(self, new_state: State):
-        """Called by the engine when state changes. Update icon."""
-        self._icon.icon = _make_icon(new_state)
-        self._icon.title = f"AirPods Auto-Switch — {new_state.value}"
+        if getattr(self.panel, 'headless', False):
+            try:
+                self._icon.run(setup=self._setup)
+            finally:
+                self.engine.stop()
+                self.ready.clear()
+            return
+        self._icon.run_detached(setup=self._setup)
         try:
-            self._icon.update_menu()
-        except Exception:
-            pass
+            self.panel.mainloop()
+        finally:
+            self.engine.stop()
+            self.ready.clear()
+            self._icon.stop()
 
-    def _on_snooze_toggle(self, icon, item):
-        self.engine.toggle_snooze()
 
-    def _on_connect(self, icon, item):
-        threading.Thread(target=self.engine.manual_connect, daemon=True).start()
-
-    def _on_disconnect(self, icon, item):
-        threading.Thread(target=self.engine.manual_disconnect, daemon=True).start()
-
-    def _on_quit(self, icon, item):
-        log.info("Quit requested.")
-        self.engine.stop()
-        icon.stop()
-
-    def _on_settings(self, icon, item):
-        log.info("Settings requested.")
-        import subprocess, sys
-        subprocess.Popen([sys.executable, "--settings"])
+class HeadlessPanel:
+    headless = True
+    def dispatch(self, action, *args):
+        if action == 'show_settings':
+            self.engine.request_mode(False)
+        elif action == 'tray_menu':
+            from app_lifecycle import launch_menu
+            launch_menu(*args)
+        elif action == 'quit':
+            self.engine._stop.set()
+            self.tray._icon.stop()
+        elif action == 'relaunch':
+            from app_lifecycle import launch_replacement
+            launch_replacement(args[0])
+            self.tray._icon.stop()

@@ -1,101 +1,67 @@
-"""
-AirPods Auto-Switch — Audio Monitor
-Detects whether Windows is currently outputting audio by checking ALL 
-active render endpoints via WASAPI / pycaw. Supports App Blacklisting.
-"""
-
+"""Inspect playback only: exclude microphones, system sounds and muted sessions."""
 import logging
+import threading
 import comtypes
-from ctypes import cast, POINTER
-
 from pycaw.pycaw import AudioUtilities, IAudioMeterInformation
-from comtypes import CLSCTX_ALL
-
+from pycaw.api.audiopolicy import IAudioSessionControl2, IAudioSessionManager2
+from pycaw.constants import EDataFlow
+from pycaw.utils import AudioSession
 from settings_manager import settings
+from audio_endpoints import render_endpoints
 
 log = logging.getLogger(__name__)
 
 
+def eligible_session(process_name, active, muted, volume, blacklist):
+    system_hosts = {'shellexperiencehost.exe', 'startmenuexperiencehost.exe'}
+    return bool(process_name and active and not muted and volume > 0 and process_name.casefold() not in blacklist | system_hosts)
+
+
 class AudioMonitor:
-    """Monitors active audio sessions for activity, applying app filtering."""
-
     def __init__(self):
-        self._setup_done = False
+        self._local = threading.local()
+        self.last_source = ''
 
-    def get_peak_level(self) -> float:
-        """
-        Return the max peak audio level across non-blacklisted active sessions (0.0 – 1.0).
-        Returns 0.0 on any error.
-        """
-        if not self._setup_done:
+    def _init_com(self):
+        if not getattr(self._local, 'ready', False):
             comtypes.CoInitialize()
-            self._setup_done = True
+            self._local.ready = True
 
-        max_peak = 0.0
-        
-        # Pull dynamic settings
-        threshold = settings.get("AUDIO_THRESHOLD", 0.001)
-        use_blacklist = settings.get("BLACKLIST_ENABLED", True)
-        blacklist = settings.get("APP_BLACKLIST", [])
-
+    def get_peak_level(self):
+        self._init_com()
+        peak = 0.0
+        source = ''
+        cfg = settings.snapshot()
+        blacklist = {p.strip().casefold() for p in cfg['APP_BLACKLIST']}
         try:
-            from pycaw.api.audiopolicy import IAudioSessionControl2
-            from pycaw.utils import AudioSession
-            
-            sessions = []
-            devices = AudioUtilities.GetAllDevices()
-            for d in devices:
-                if d.state.value == 1 and d.AudioSessionManager:
-                    enum = d.AudioSessionManager.GetSessionEnumerator()
-                    for i in range(enum.GetCount()):
-                        ctl = enum.GetSession(i)
-                        if ctl:
-                            ctl2 = ctl.QueryInterface(IAudioSessionControl2)
-                            if ctl2:
-                                sessions.append(AudioSession(ctl2))
-            for session in sessions:
+            for device in render_endpoints():
                 try:
-                    # Ignore System Sounds and other sessions without a valid process if needed
-                    # "Idle" is sometimes reported for system things. 
-                    proc_name = session.Process.name() if session.Process else None
-                    
-                    if use_blacklist and proc_name in blacklist:
-                        continue # Skip blacklisted apps
-
-                    # Try to read the peak meter for this specific session
-                    try:
-                        meter = session._ctl.QueryInterface(IAudioMeterInformation)
-                        val = meter.GetPeakValue()
-                        if val > max_peak:
-                            max_peak = val
-                    except Exception:
-                        pass
-                    
-
-
+                    manager = device.Activate(IAudioSessionManager2._iid_, comtypes.CLSCTX_ALL, None).QueryInterface(IAudioSessionManager2)
+                    sessions = manager.GetSessionEnumerator()
+                    for index in range(sessions.GetCount()):
+                        try:
+                            session = AudioSession(sessions.GetSession(index).QueryInterface(IAudioSessionControl2))
+                            process = session.Process
+                            name = process.name() if process else None
+                            volume = session.SimpleAudioVolume
+                            if not eligible_session(name, session.State == 1, volume.GetMute(), volume.GetMasterVolume(), blacklist):
+                                continue
+                            value = session._ctl.QueryInterface(IAudioMeterInformation).GetPeakValue()
+                            if value > peak:
+                                peak, source = value, name
+                        except Exception:
+                            continue
                 except Exception:
-                    pass
-        except Exception as e:
-            log.error(f"Failed to enumerate audio sessions: {e}")
-            return 0.0
+                    log.debug('Playback endpoint is transitioning', exc_info=True)
+        except Exception:
+            log.warning('Cannot inspect Windows playback', exc_info=True)
+        self.last_source = source
+        return peak
 
-        return max_peak
-
-    def is_audio_playing(self) -> bool:
-        """True if audio output exceeds the configured threshold."""
-        level = self.get_peak_level()
-        threshold = settings.get("AUDIO_THRESHOLD", 0.001)
-        
-        log.debug(f"Polled max peak level across devices: {level:.6f}")
-        if level > threshold:
-            log.debug(f"Audio playing (peak={level:.4f})")
-            return True
-        return False
+    def is_audio_playing(self):
+        return self.get_peak_level() > float(settings.get('AUDIO_THRESHOLD', 0.001))
 
     def cleanup(self):
-        """Release COM resources."""
-        self._setup_done = False
-        try:
+        if getattr(self._local, 'ready', False):
+            self._local.ready = False
             comtypes.CoUninitialize()
-        except Exception:
-            pass
