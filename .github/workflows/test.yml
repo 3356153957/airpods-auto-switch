@@ -1,0 +1,35 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+      - name: Install locked dependencies
+        run: python -m pip install -r requirements-lock.txt
+      - name: Verify bundled pairing tool checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -LiteralPath vendor/BluetoothDevicePairing.exe -Algorithm SHA256).Hash
+          if ($hash -ne '6558860924D2DD9DC2A8A6EB6F8B3C6080F762AEC1C57A91CBDCACD3259B9621') { throw "BluetoothDevicePairing.exe checksum mismatch: $hash" }
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v

@@ -2,6 +2,10 @@
 
 电脑开始播放时，将已配对的 AirPods 连接到 Windows，并切换默认播放输出。需要时开启，用完可从托盘暂停。
 
+[![Test](https://github.com/3356153957/airpods-auto-switch/actions/workflows/test.yml/badge.svg)](https://github.com/3356153957/airpods-auto-switch/actions/workflows/test.yml)
+[![Latest release](https://img.shields.io/github/v/release/3356153957/airpods-auto-switch)](https://github.com/3356153957/airpods-auto-switch/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20x64-0078D4)](#快速开始)
+
 [下载 Windows 版](https://github.com/3356153957/airpods-auto-switch/releases/latest) · [使用与更新说明](README.zh-CN.md) · [第三方声明](THIRD-PARTY-NOTICES.md)
 
 ## 快速开始
