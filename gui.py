@@ -9,7 +9,7 @@ from tkinter import messagebox
 import customtkinter as ctk
 from bluetooth_manager import BluetoothManager
 from settings_manager import settings, SETTINGS_DIR, STATUS_FILE, send_command, write_json
-from ui_styles import BG, SURFACE, TEXT, MUTED, BORDER, BLUE, BLUE_SOFT, GREEN, FONT, icon, button, apply_native_chrome
+from ui_styles import BG, SURFACE, TEXT, MUTED, BORDER, BLUE, BLUE_SOFT, GREEN, FONT, SWITCH_OFF, icon, button, apply_native_chrome
 from app_version import VERSION, RELEASES_URL
 
 TITLE = 'AirPods 自动接管'
@@ -136,7 +136,7 @@ class SettingsGUI(ctk.CTk):
         first.pack(fill='x', padx=22, pady=(17, 2))
         self._icon_label(first, 'power', '电脑播放时自动接管').pack(side='left')
         self.auto_switch = ctk.CTkSwitch(first, text='', variable=self.enabled, command=self._toggle, width=44, switch_width=40, switch_height=22,
-            progress_color=BLUE, fg_color='#CAD4DE', button_color=SURFACE, button_hover_color='#F0F5FA')
+            progress_color=BLUE, fg_color=SWITCH_OFF, button_color=SURFACE, button_hover_color='#F0F5FA')
         self.auto_switch.pack(side='right')
         self.label(auto, '需要时打开，耳机会在电脑开始播放后连接过来。', 12, MUTED).pack(anchor='w', padx=22, pady=(3, 12))
         ctk.CTkFrame(auto, height=1, fg_color='#EDF0F4').pack(fill='x', padx=22)
@@ -147,7 +147,7 @@ class SettingsGUI(ctk.CTk):
         self.label(timing_text, '播放确认时间', 12).pack(anchor='w')
         self.label(timing_text, '过滤短促声音，连接另需几秒', 11, MUTED).pack(anchor='w')
         self.delay_control = ctk.CTkSegmentedButton(timing, values=['0.5 秒', '1 秒', '2 秒', '3 秒'], variable=self.delay,
-            height=32, corner_radius=6, font=ctk.CTkFont(FONT, 12), selected_color='#D5E5FA', selected_hover_color='#C6DCF8',
+            height=32, corner_radius=6, font=ctk.CTkFont(FONT, 12), selected_color='#B9D3F3', selected_hover_color='#A9C8EF',
             fg_color='#EDF2F7', unselected_color='#EDF2F7', unselected_hover_color='#DEE8F4', text_color=TEXT, text_color_disabled=MUTED, dynamic_resizing=False, width=240)
         self.delay_control.pack(side='right', padx=(12, 0))
 
@@ -238,7 +238,7 @@ class SettingsGUI(ctk.CTk):
         self.label(text, title, 12, bold=True).pack(anchor='w')
         self.label(text, description, 11, MUTED).pack(anchor='w', pady=(1, 0))
         ctk.CTkSwitch(row, text='', variable=variable, command=callback, width=44, switch_width=40, switch_height=22,
-            progress_color=BLUE, fg_color='#CAD4DE', button_color=SURFACE, button_hover_color='#F0F5FA').pack(side='right')
+            progress_color=BLUE, fg_color=SWITCH_OFF, button_color=SURFACE, button_hover_color='#F0F5FA').pack(side='right')
 
     def _signature(self):
         return (self.device.get().strip(), self.delay.get(), self.blacklist.get().strip())
@@ -246,8 +246,13 @@ class SettingsGUI(ctk.CTk):
     def _mark_dirty(self, *_):
         if not self._view_built:
             return
-        if self._signature() != self._saved_signature:
-            self.feedback.configure(text='有未保存的更改', text_color=BLUE)
+        signature = self._signature()
+        if signature != self._saved_signature:
+            if not self._saved_signature[0] and signature[0] and signature[1:] == self._saved_signature[1:]:
+                # First run: a paired device was pre-selected but nothing is saved yet.
+                self.feedback.configure(text=f'已选中「{signature[0]}」，点击“保存设置”后生效', text_color=BLUE)
+            else:
+                self.feedback.configure(text='有未保存的更改', text_color=BLUE)
         else:
             self.feedback.configure(text='设置保存在本机', text_color=MUTED)
 

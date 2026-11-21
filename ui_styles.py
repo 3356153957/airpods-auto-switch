@@ -11,6 +11,8 @@ MUTED = '#5A6D7D'
 BORDER = '#E4E8ED'
 BLUE = '#2F70BF'
 BLUE_SOFT = '#EDF4FC'
+# Switch "off" track: 3.3:1 against SURFACE (WCAG 1.4.11 non-text contrast).
+SWITCH_OFF = '#7F8FA2'
 GREEN = '#147D5F'
 FONT = 'Microsoft YaHei UI'
 
